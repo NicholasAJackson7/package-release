@@ -1,0 +1,124 @@
+name: Publish to GitHub Packages
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@nicholasajackson7'
+
+      - name: Get merged PR labels
+        id: pr
+        uses: actions-ecosystem/action-get-merged-pull-request@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version bump type
+        id: bump
+        run: |
+          LABELS="${{ steps.pr.outputs.labels }}"
+          echo "PR Labels: $LABELS"
+          
+          if echo "$LABELS" | grep -iq "breaking"; then
+            echo "type=major" >> $GITHUB_OUTPUT
+          elif echo "$LABELS" | grep -iq "feature"; then
+            echo "type=minor" >> $GITHUB_OUTPUT
+          elif echo "$LABELS" | grep -iq "bug"; then
+            echo "type=patch" >> $GITHUB_OUTPUT
+          else
+            echo "type=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Calculate new version
+        if: steps.bump.outputs.type != 'none'
+        id: version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          # Strip any existing prerelease suffix to get base version
+          BASE_VERSION=$(echo "$CURRENT_VERSION" | sed 's/-.*$//')
+          
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          
+          BUMP_TYPE="${{ steps.bump.outputs.type }}"
+          
+          if [ "$BUMP_TYPE" = "major" ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [ "$BUMP_TYPE" = "minor" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          elif [ "$BUMP_TYPE" = "patch" ]; then
+            PATCH=$((PATCH + 1))
+          fi
+          
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}-beta.${SHORT_SHA}"
+          
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "Bumping from $CURRENT_VERSION to $NEW_VERSION ($BUMP_TYPE)"
+
+      - name: Update package.json version
+        if: steps.bump.outputs.type != 'none'
+        run: |
+          npm version ${{ steps.version.outputs.new }} --no-git-tag-version
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
+          git push
+
+      - name: Install dependencies
+        if: steps.bump.outputs.type != 'none'
+        run: npm ci
+
+      - name: Build
+        if: steps.bump.outputs.type != 'none'
+        run: npm run build
+
+      - name: Create Release Tag
+        if: steps.bump.outputs.type != 'none'
+        run: |
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        if: steps.bump.outputs.type != 'none'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          prerelease: true
+
+      - name: Publish to GitHub Packages
+        if: steps.bump.outputs.type != 'none'
+        run: npm publish --tag beta
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Skip message
+        if: steps.bump.outputs.type == 'none'
+        run: echo "No version bump label found (Bug, Feature, or Breaking). Skipping publish."

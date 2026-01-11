@@ -1,5 +1,5 @@
 {
-  "name": "@nicho/package-release",
+  "name": "@nicholasajackson7/package-release",
   "version": "0.0.1",
   "description": "A test React component library for GitHub Packages",
   "type": "module",
@@ -19,7 +19,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Nicho/package-release.git"
+    "url": "https://github.com/NicholasAJackson7/package-release.git"
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
