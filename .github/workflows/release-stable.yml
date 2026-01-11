@@ -1,0 +1,151 @@
+name: Release Stable Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_version:
+        description: 'New version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+      previous_version:
+        description: 'Previous version for changelog comparison (e.g., 0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Validate versions
+        run: |
+          NEW_VERSION="${{ inputs.new_version }}"
+          PREV_VERSION="${{ inputs.previous_version }}"
+          
+          # Validate semver format (basic check)
+          if ! echo "$NEW_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Invalid new version format: $NEW_VERSION"
+            echo "Expected format: X.Y.Z (e.g., 1.0.0)"
+            exit 1
+          fi
+          
+          if ! echo "$PREV_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Invalid previous version format: $PREV_VERSION"
+            echo "Expected format: X.Y.Z (e.g., 0.1.0)"
+            exit 1
+          fi
+          
+          echo "✅ New version: $NEW_VERSION"
+          echo "✅ Previous version: $PREV_VERSION"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@nicholasajackson7'
+
+      - name: Update package.json version
+        run: |
+          npm version ${{ inputs.new_version }} --no-git-tag-version
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: release v${{ inputs.new_version }}"
+          git push
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Create Release Tag
+        run: |
+          git tag -a "v${{ inputs.new_version }}" -m "Release v${{ inputs.new_version }}"
+          git push origin "v${{ inputs.new_version }}"
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          PREV_TAG="v${{ inputs.previous_version }}"
+          NEW_TAG="v${{ inputs.new_version }}"
+          
+          echo "Generating release notes from $PREV_TAG to HEAD"
+          
+          # Check if previous tag exists
+          if ! git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            echo "⚠️ Previous tag $PREV_TAG not found, using all commits"
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          
+          # Create release notes file
+          {
+            echo "## What's Changed"
+            echo ""
+            
+            # Get all commits since last stable release, group by type
+            BREAKING=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --grep="^breaking" --regexp-ignore-case 2>/dev/null || true)
+            FEATURES=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --grep="^feat" --regexp-ignore-case 2>/dev/null || true)
+            FIXES=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --grep="^fix" --regexp-ignore-case 2>/dev/null || true)
+            
+            if [ -n "$BREAKING" ]; then
+              echo "### ⚠️ Breaking Changes"
+              echo "$BREAKING"
+              echo ""
+            fi
+            
+            if [ -n "$FEATURES" ]; then
+              echo "### ✨ Features"
+              echo "$FEATURES"
+              echo ""
+            fi
+            
+            if [ -n "$FIXES" ]; then
+              echo "### 🐛 Bug Fixes"
+              echo "$FIXES"
+              echo ""
+            fi
+            
+            # If no categorized commits, show all commits
+            if [ -z "$BREAKING" ] && [ -z "$FEATURES" ] && [ -z "$FIXES" ]; then
+              echo "### 📝 Changes"
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" 2>/dev/null || echo "- Initial release"
+              echo ""
+            fi
+            
+            echo ""
+            echo "**Full Changelog**: https://github.com/NicholasAJackson7/package-release/compare/${PREV_TAG}...${NEW_TAG}"
+          } > release_notes.md
+          
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.new_version }}
+          name: v${{ inputs.new_version }}
+          body_path: release_notes.md
+          prerelease: false
+
+      - name: Publish to GitHub Packages
+        run: npm publish --tag latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Released v${{ inputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Previous version: v${{ inputs.previous_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- New version: v${{ inputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- npm tag: \`latest\`" >> $GITHUB_STEP_SUMMARY
