@@ -22,7 +22,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
       label,
       helperText,
       error,
-      size = 'md',
+      size = 'lg',
       leftIcon,
       rightIcon,
       className = '',
