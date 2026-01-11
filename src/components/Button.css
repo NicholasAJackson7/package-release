@@ -66,8 +66,8 @@
 }
 
 .btn-spinner {
-  width: 1em;
-  height: 1em;
+  width: 2em;
+  height: 2em;
   border: 2px solid currentColor;
   border-right-color: transparent;
   border-radius: 50%;
