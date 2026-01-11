@@ -12,13 +12,13 @@
 }
 
 .btn:disabled {
-  opacity: 0.6;
+  opacity: 0.9;
   cursor: not-allowed;
 }
 
 /* Sizes */
 .btn-sm {
-  padding: 0.375rem 0.75rem;
+  padding: 0.4rem 0.75rem;
   font-size: 0.875rem;
 }
 
