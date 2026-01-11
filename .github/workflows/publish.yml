@@ -32,31 +32,108 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine version bump type
-        id: bump
+      - name: Check if PR has release label
+        id: has_label
         run: |
           LABELS="${{ steps.pr.outputs.labels }}"
           echo "PR Labels: $LABELS"
           
-          if echo "$LABELS" | grep -iq "breaking"; then
+          if echo "$LABELS" | grep -iqE "breaking|feature|bug"; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "No release label found (Bug, Feature, or Breaking). Skipping publish."
+          fi
+
+      - name: Get last stable version
+        if: steps.has_label.outputs.should_release == 'true'
+        id: last_stable
+        run: |
+          # Find the most recent stable tag (no prerelease suffix)
+          LAST_STABLE_TAG=$(git tag -l 'v*' | grep -v '-' | sort -V | tail -n 1 || echo "")
+          
+          if [ -z "$LAST_STABLE_TAG" ]; then
+            LAST_STABLE_VERSION="0.0.0"
+            LAST_STABLE_TAG=""
+            echo "No previous stable release found, starting from 0.0.0"
+          else
+            LAST_STABLE_VERSION=$(echo "$LAST_STABLE_TAG" | sed 's/^v//')
+            echo "Last stable release: $LAST_STABLE_TAG ($LAST_STABLE_VERSION)"
+          fi
+          
+          echo "version=$LAST_STABLE_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$LAST_STABLE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Determine highest bump type since last stable
+        if: steps.has_label.outputs.should_release == 'true'
+        id: bump
+        run: |
+          LAST_STABLE_TAG="${{ steps.last_stable.outputs.tag }}"
+          
+          # Get all merged PR commits since last stable (or all if no stable)
+          if [ -z "$LAST_STABLE_TAG" ]; then
+            COMMIT_RANGE="HEAD"
+            # Get all merge commits
+            MERGE_COMMITS=$(git log --merges --pretty=format:"%H" || echo "")
+          else
+            COMMIT_RANGE="${LAST_STABLE_TAG}..HEAD"
+            # Get merge commits since last stable
+            MERGE_COMMITS=$(git log ${COMMIT_RANGE} --merges --pretty=format:"%H" || echo "")
+          fi
+          
+          echo "Analyzing commits since last stable release..."
+          
+          HAS_BREAKING=false
+          HAS_FEATURE=false
+          HAS_BUG=false
+          
+          # Check current PR labels
+          CURRENT_LABELS="${{ steps.pr.outputs.labels }}"
+          if echo "$CURRENT_LABELS" | grep -iq "breaking"; then
+            HAS_BREAKING=true
+          fi
+          if echo "$CURRENT_LABELS" | grep -iq "feature"; then
+            HAS_FEATURE=true
+          fi
+          if echo "$CURRENT_LABELS" | grep -iq "bug"; then
+            HAS_BUG=true
+          fi
+          
+          # Also check commit messages for conventional commit hints
+          if [ -n "$LAST_STABLE_TAG" ]; then
+            if git log ${COMMIT_RANGE} --pretty=format:"%s" | grep -iqE "^breaking|BREAKING CHANGE"; then
+              HAS_BREAKING=true
+            fi
+            if git log ${COMMIT_RANGE} --pretty=format:"%s" | grep -iqE "^feat"; then
+              HAS_FEATURE=true
+            fi
+            if git log ${COMMIT_RANGE} --pretty=format:"%s" | grep -iqE "^fix"; then
+              HAS_BUG=true
+            fi
+          fi
+          
+          # Determine highest priority bump
+          if [ "$HAS_BREAKING" = true ]; then
             echo "type=major" >> $GITHUB_OUTPUT
-          elif echo "$LABELS" | grep -iq "feature"; then
+            echo "Highest bump type: MAJOR (breaking changes detected)"
+          elif [ "$HAS_FEATURE" = true ]; then
             echo "type=minor" >> $GITHUB_OUTPUT
-          elif echo "$LABELS" | grep -iq "bug"; then
+            echo "Highest bump type: MINOR (features detected)"
+          elif [ "$HAS_BUG" = true ]; then
             echo "type=patch" >> $GITHUB_OUTPUT
+            echo "Highest bump type: PATCH (bug fixes detected)"
           else
             echo "type=none" >> $GITHUB_OUTPUT
+            echo "No bump type detected"
           fi
 
       - name: Calculate new version
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         id: version
         run: |
-          CURRENT_VERSION=$(node -p "require('./package.json').version")
-          # Strip any existing prerelease suffix to get base version
-          BASE_VERSION=$(echo "$CURRENT_VERSION" | sed 's/-.*$//')
+          LAST_STABLE="${{ steps.last_stable.outputs.version }}"
           
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LAST_STABLE"
           
           BUMP_TYPE="${{ steps.bump.outputs.type }}"
           
@@ -73,14 +150,15 @@ jobs:
           
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}-beta.${SHORT_SHA}"
+          BASE_VERSION="${MAJOR}.${MINOR}.${PATCH}"
           
-          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "base=$BASE_VERSION" >> $GITHUB_OUTPUT
           echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "Bumping from $CURRENT_VERSION to $NEW_VERSION ($BUMP_TYPE)"
+          echo "Version: $NEW_VERSION (base: $BASE_VERSION, bump: $BUMP_TYPE from $LAST_STABLE)"
 
       - name: Update package.json version
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         run: |
           npm version ${{ steps.version.outputs.new }} --no-git-tag-version
           
@@ -91,21 +169,21 @@ jobs:
           git push
 
       - name: Install dependencies
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         run: npm ci
 
       - name: Build
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         run: npm run build
 
       - name: Create Release Tag
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         run: |
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
       - name: Create GitHub Release
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -114,11 +192,19 @@ jobs:
           prerelease: true
 
       - name: Publish to GitHub Packages
-        if: steps.bump.outputs.type != 'none'
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         run: npm publish --tag beta
         env:
           NODE_AUTH_TOKEN: ${{ secrets.PAT_TOKEN }}
 
-      - name: Skip message
-        if: steps.bump.outputs.type == 'none'
-        run: echo "No version bump label found (Bug, Feature, or Breaking). Skipping publish."
+      - name: Summary
+        if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
+        run: |
+          echo "## 🚀 Beta Released: ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Last Stable | v${{ steps.last_stable.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bump Type | ${{ steps.bump.outputs.type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| New Version | ${{ steps.version.outputs.new }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| npm Tag | \`beta\` |" >> $GITHUB_STEP_SUMMARY
