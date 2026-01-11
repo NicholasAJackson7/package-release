@@ -8,6 +8,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Skip if commit is from the bot (e.g., version bump commits)
+    if: github.actor != 'github-actions[bot]'
     permissions:
       contents: write
       packages: write
