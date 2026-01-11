@@ -45,117 +45,121 @@ jobs:
             echo "No release label found (Bug, Feature, or Breaking). Skipping publish."
           fi
 
-      - name: Get last stable version
+      - name: Get current and stable versions
         if: steps.has_label.outputs.should_release == 'true'
-        id: last_stable
+        id: versions
         run: |
+          # Get current version from package.json
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          # Strip beta suffix to get current base
+          CURRENT_BASE=$(echo "$CURRENT_VERSION" | sed 's/-.*$//')
+          
+          echo "Current package.json version: $CURRENT_VERSION (base: $CURRENT_BASE)"
+          
           # Find the most recent stable tag (no prerelease suffix)
           LAST_STABLE_TAG=$(git tag -l 'v*' | grep -v '-' | sort -V | tail -n 1 || echo "")
           
           if [ -z "$LAST_STABLE_TAG" ]; then
             LAST_STABLE_VERSION="0.0.0"
-            LAST_STABLE_TAG=""
             echo "No previous stable release found, starting from 0.0.0"
           else
             LAST_STABLE_VERSION=$(echo "$LAST_STABLE_TAG" | sed 's/^v//')
             echo "Last stable release: $LAST_STABLE_TAG ($LAST_STABLE_VERSION)"
           fi
           
-          echo "version=$LAST_STABLE_VERSION" >> $GITHUB_OUTPUT
-          echo "tag=$LAST_STABLE_TAG" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "current_base=$CURRENT_BASE" >> $GITHUB_OUTPUT
+          echo "last_stable=$LAST_STABLE_VERSION" >> $GITHUB_OUTPUT
+          echo "last_stable_tag=$LAST_STABLE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Determine highest bump type since last stable
+      - name: Determine bump type from current PR
         if: steps.has_label.outputs.should_release == 'true'
         id: bump
         run: |
-          LAST_STABLE_TAG="${{ steps.last_stable.outputs.tag }}"
+          LABELS="${{ steps.pr.outputs.labels }}"
           
-          # Get all merged PR commits since last stable (or all if no stable)
-          if [ -z "$LAST_STABLE_TAG" ]; then
-            COMMIT_RANGE="HEAD"
-            # Get all merge commits
-            MERGE_COMMITS=$(git log --merges --pretty=format:"%H" || echo "")
-          else
-            COMMIT_RANGE="${LAST_STABLE_TAG}..HEAD"
-            # Get merge commits since last stable
-            MERGE_COMMITS=$(git log ${COMMIT_RANGE} --merges --pretty=format:"%H" || echo "")
-          fi
-          
-          echo "Analyzing commits since last stable release..."
-          
-          HAS_BREAKING=false
-          HAS_FEATURE=false
-          HAS_BUG=false
-          
-          # Check current PR labels
-          CURRENT_LABELS="${{ steps.pr.outputs.labels }}"
-          if echo "$CURRENT_LABELS" | grep -iq "breaking"; then
-            HAS_BREAKING=true
-          fi
-          if echo "$CURRENT_LABELS" | grep -iq "feature"; then
-            HAS_FEATURE=true
-          fi
-          if echo "$CURRENT_LABELS" | grep -iq "bug"; then
-            HAS_BUG=true
-          fi
-          
-          # Also check commit messages for conventional commit hints
-          if [ -n "$LAST_STABLE_TAG" ]; then
-            if git log ${COMMIT_RANGE} --pretty=format:"%s" | grep -iqE "^breaking|BREAKING CHANGE"; then
-              HAS_BREAKING=true
-            fi
-            if git log ${COMMIT_RANGE} --pretty=format:"%s" | grep -iqE "^feat"; then
-              HAS_FEATURE=true
-            fi
-            if git log ${COMMIT_RANGE} --pretty=format:"%s" | grep -iqE "^fix"; then
-              HAS_BUG=true
-            fi
-          fi
-          
-          # Determine highest priority bump
-          if [ "$HAS_BREAKING" = true ]; then
+          # Determine bump type from PR label
+          if echo "$LABELS" | grep -iq "breaking"; then
             echo "type=major" >> $GITHUB_OUTPUT
-            echo "Highest bump type: MAJOR (breaking changes detected)"
-          elif [ "$HAS_FEATURE" = true ]; then
+            echo "Current PR bump type: MAJOR"
+          elif echo "$LABELS" | grep -iq "feature"; then
             echo "type=minor" >> $GITHUB_OUTPUT
-            echo "Highest bump type: MINOR (features detected)"
-          elif [ "$HAS_BUG" = true ]; then
+            echo "Current PR bump type: MINOR"
+          elif echo "$LABELS" | grep -iq "bug"; then
             echo "type=patch" >> $GITHUB_OUTPUT
-            echo "Highest bump type: PATCH (bug fixes detected)"
+            echo "Current PR bump type: PATCH"
           else
             echo "type=none" >> $GITHUB_OUTPUT
-            echo "No bump type detected"
           fi
 
-      - name: Calculate new version
+      - name: Calculate new version (never downgrade)
         if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
         id: version
         run: |
-          LAST_STABLE="${{ steps.last_stable.outputs.version }}"
-          
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$LAST_STABLE"
-          
+          LAST_STABLE="${{ steps.versions.outputs.last_stable }}"
+          CURRENT_BASE="${{ steps.versions.outputs.current_base }}"
           BUMP_TYPE="${{ steps.bump.outputs.type }}"
           
+          # Calculate what version this PR would create from last stable
+          IFS='.' read -r STABLE_MAJOR STABLE_MINOR STABLE_PATCH <<< "$LAST_STABLE"
+          
           if [ "$BUMP_TYPE" = "major" ]; then
-            MAJOR=$((MAJOR + 1))
-            MINOR=0
-            PATCH=0
+            PR_MAJOR=$((STABLE_MAJOR + 1))
+            PR_MINOR=0
+            PR_PATCH=0
           elif [ "$BUMP_TYPE" = "minor" ]; then
-            MINOR=$((MINOR + 1))
-            PATCH=0
+            PR_MAJOR=$STABLE_MAJOR
+            PR_MINOR=$((STABLE_MINOR + 1))
+            PR_PATCH=0
           elif [ "$BUMP_TYPE" = "patch" ]; then
-            PATCH=$((PATCH + 1))
+            PR_MAJOR=$STABLE_MAJOR
+            PR_MINOR=$STABLE_MINOR
+            PR_PATCH=$((STABLE_PATCH + 1))
+          fi
+          
+          PR_VERSION="${PR_MAJOR}.${PR_MINOR}.${PR_PATCH}"
+          
+          # Compare with current base version - take the higher one
+          IFS='.' read -r CURR_MAJOR CURR_MINOR CURR_PATCH <<< "$CURRENT_BASE"
+          
+          echo "PR would create: $PR_VERSION"
+          echo "Current base: $CURRENT_BASE"
+          
+          # Compare versions (higher wins)
+          USE_CURRENT=false
+          if [ "$CURR_MAJOR" -gt "$PR_MAJOR" ]; then
+            USE_CURRENT=true
+          elif [ "$CURR_MAJOR" -eq "$PR_MAJOR" ]; then
+            if [ "$CURR_MINOR" -gt "$PR_MINOR" ]; then
+              USE_CURRENT=true
+            elif [ "$CURR_MINOR" -eq "$PR_MINOR" ]; then
+              if [ "$CURR_PATCH" -gt "$PR_PATCH" ]; then
+                USE_CURRENT=true
+              fi
+            fi
+          fi
+          
+          if [ "$USE_CURRENT" = true ]; then
+            FINAL_MAJOR=$CURR_MAJOR
+            FINAL_MINOR=$CURR_MINOR
+            FINAL_PATCH=$CURR_PATCH
+            echo "Using current base version (higher): $CURRENT_BASE"
+          else
+            FINAL_MAJOR=$PR_MAJOR
+            FINAL_MINOR=$PR_MINOR
+            FINAL_PATCH=$PR_PATCH
+            echo "Using PR calculated version (higher or equal): $PR_VERSION"
           fi
           
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}-beta.${SHORT_SHA}"
-          BASE_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEW_VERSION="${FINAL_MAJOR}.${FINAL_MINOR}.${FINAL_PATCH}-beta.${SHORT_SHA}"
+          BASE_VERSION="${FINAL_MAJOR}.${FINAL_MINOR}.${FINAL_PATCH}"
           
           echo "base=$BASE_VERSION" >> $GITHUB_OUTPUT
           echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "Version: $NEW_VERSION (base: $BASE_VERSION, bump: $BUMP_TYPE from $LAST_STABLE)"
+          echo ""
+          echo "Final version: $NEW_VERSION"
 
       - name: Update package.json version
         if: steps.has_label.outputs.should_release == 'true' && steps.bump.outputs.type != 'none'
@@ -204,7 +208,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Last Stable | v${{ steps.last_stable.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Bump Type | ${{ steps.bump.outputs.type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Last Stable | v${{ steps.versions.outputs.last_stable }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Current Base | ${{ steps.versions.outputs.current_base }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Bump Type | ${{ steps.bump.outputs.type }} |" >> $GITHUB_STEP_SUMMARY
           echo "| New Version | ${{ steps.version.outputs.new }} |" >> $GITHUB_STEP_SUMMARY
           echo "| npm Tag | \`beta\` |" >> $GITHUB_STEP_SUMMARY
