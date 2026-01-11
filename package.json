@@ -1,6 +1,6 @@
 {
   "name": "@nicholasajackson7/package-release",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A test React component library for GitHub Packages",
   "type": "module",
   "main": "./dist/index.cjs",
