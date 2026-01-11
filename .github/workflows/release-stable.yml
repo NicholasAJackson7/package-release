@@ -18,6 +18,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      pull-requests: read
 
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +31,6 @@ jobs:
           NEW_VERSION="${{ inputs.new_version }}"
           PREV_VERSION="${{ inputs.previous_version }}"
           
-          # Validate semver format (basic check)
           if ! echo "$NEW_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "❌ Invalid new version format: $NEW_VERSION"
             echo "Expected format: X.Y.Z (e.g., 1.0.0)"
@@ -74,59 +74,100 @@ jobs:
           git tag -a "v${{ inputs.new_version }}" -m "Release v${{ inputs.new_version }}"
           git push origin "v${{ inputs.new_version }}"
 
-      - name: Generate release notes
-        id: release_notes
+      - name: Generate release notes from PR labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PREV_TAG="v${{ inputs.previous_version }}"
           NEW_TAG="v${{ inputs.new_version }}"
           
-          echo "Generating release notes from $PREV_TAG to HEAD"
+          echo "Generating release notes from $PREV_TAG to $NEW_TAG"
           
-          # Check if previous tag exists
-          if ! git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
-            echo "⚠️ Previous tag $PREV_TAG not found, using all commits"
-            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          # Get the date of the previous tag (or repo creation if tag doesn't exist)
+          if git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            SINCE_DATE=$(git log -1 --format=%aI "$PREV_TAG")
+          else
+            SINCE_DATE=$(git log --reverse --format=%aI | head -1)
           fi
+          
+          echo "Finding PRs merged since: $SINCE_DATE"
+          
+          # Get merged PRs since the previous release
+          # Query PRs and extract their numbers, titles, authors, and labels
+          gh pr list \
+            --repo ${{ github.repository }} \
+            --state merged \
+            --search "merged:>=$SINCE_DATE" \
+            --json number,title,author,labels \
+            --limit 200 > prs.json
+          
+          echo "Found $(cat prs.json | jq length) merged PRs"
           
           # Create release notes file
           {
-            echo "## What's Changed"
+            echo "## What's Changed in v${{ inputs.new_version }}"
             echo ""
             
-            # Get all commits since last stable release, group by type
-            BREAKING=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --grep="^breaking" --regexp-ignore-case 2>/dev/null || true)
-            FEATURES=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --grep="^feat" --regexp-ignore-case 2>/dev/null || true)
-            FIXES=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --grep="^fix" --regexp-ignore-case 2>/dev/null || true)
-            
+            # Breaking Changes
+            BREAKING=$(cat prs.json | jq -r '.[] | select(.labels[].name | test("breaking"; "i")) | "- \(.title) (#\(.number)) @\(.author.login)"' 2>/dev/null | sort -u)
             if [ -n "$BREAKING" ]; then
               echo "### ⚠️ Breaking Changes"
               echo "$BREAKING"
               echo ""
             fi
             
+            # Features
+            FEATURES=$(cat prs.json | jq -r '.[] | select(.labels[].name | test("feature"; "i")) | "- \(.title) (#\(.number)) @\(.author.login)"' 2>/dev/null | sort -u)
             if [ -n "$FEATURES" ]; then
               echo "### ✨ Features"
               echo "$FEATURES"
               echo ""
             fi
             
-            if [ -n "$FIXES" ]; then
+            # Bug Fixes
+            BUGS=$(cat prs.json | jq -r '.[] | select(.labels[].name | test("bug"; "i")) | "- \(.title) (#\(.number)) @\(.author.login)"' 2>/dev/null | sort -u)
+            if [ -n "$BUGS" ]; then
               echo "### 🐛 Bug Fixes"
-              echo "$FIXES"
+              echo "$BUGS"
               echo ""
             fi
             
-            # If no categorized commits, show all commits
-            if [ -z "$BREAKING" ] && [ -z "$FEATURES" ] && [ -z "$FIXES" ]; then
+            # Maintenance / Chores
+            MAINTENANCE=$(cat prs.json | jq -r '.[] | select(.labels[].name | test("maintenance|chore|refactor"; "i")) | "- \(.title) (#\(.number)) @\(.author.login)"' 2>/dev/null | sort -u)
+            if [ -n "$MAINTENANCE" ]; then
+              echo "### 🔧 Maintenance"
+              echo "$MAINTENANCE"
+              echo ""
+            fi
+            
+            # Documentation
+            DOCS=$(cat prs.json | jq -r '.[] | select(.labels[].name | test("documentation|docs"; "i")) | "- \(.title) (#\(.number)) @\(.author.login)"' 2>/dev/null | sort -u)
+            if [ -n "$DOCS" ]; then
+              echo "### 📚 Documentation"
+              echo "$DOCS"
+              echo ""
+            fi
+            
+            # Other (PRs without recognized labels)
+            OTHER=$(cat prs.json | jq -r '.[] | select((.labels | length == 0) or ((.labels[].name | test("breaking|feature|bug|maintenance|chore|refactor|documentation|docs"; "i")) | not)) | "- \(.title) (#\(.number)) @\(.author.login)"' 2>/dev/null | sort -u)
+            if [ -n "$OTHER" ]; then
+              echo "### 📝 Other Changes"
+              echo "$OTHER"
+              echo ""
+            fi
+            
+            # If no PRs found at all, show commits
+            if [ "$(cat prs.json | jq length)" -eq 0 ]; then
               echo "### 📝 Changes"
               git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" 2>/dev/null || echo "- Initial release"
               echo ""
             fi
             
             echo ""
-            echo "**Full Changelog**: https://github.com/NicholasAJackson7/package-release/compare/${PREV_TAG}...${NEW_TAG}"
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${NEW_TAG}"
           } > release_notes.md
           
+          echo "=== Generated Release Notes ==="
           cat release_notes.md
 
       - name: Create GitHub Release
@@ -149,3 +190,6 @@ jobs:
           echo "- Previous version: v${{ inputs.previous_version }}" >> $GITHUB_STEP_SUMMARY
           echo "- New version: v${{ inputs.new_version }}" >> $GITHUB_STEP_SUMMARY
           echo "- npm tag: \`latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Release Notes" >> $GITHUB_STEP_SUMMARY
+          cat release_notes.md >> $GITHUB_STEP_SUMMARY
